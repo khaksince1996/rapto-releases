@@ -1,0 +1,121 @@
+name: Build unsigned macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source tag or commit from khaksince1996/rapto
+        required: true
+        default: v1.0.2
+      release_tag:
+        description: Existing rapto-releases tag to receive the assets
+        required: true
+        default: v1.0.2
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-macos-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build macOS x64 and arm64
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: khaksince1996/rapto
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.RAPTO_SOURCE_DEPLOY_KEY }}
+          path: source
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Setup Python for node-gyp
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          package_tag="v$(node -p "require('./source/package.json').version")"
+          if [[ "$package_tag" != "${{ inputs.release_tag }}" ]]; then
+            echo "::error::Source version $package_tag does not match release tag ${{ inputs.release_tag }}."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        working-directory: source
+        run: npm ci
+
+      - name: Rebuild Electron native modules
+        working-directory: source
+        run: npm run rebuild:electron
+
+      - name: Run unit tests
+        working-directory: source
+        run: npm run test:unit
+
+      - name: Copy seed files
+        working-directory: source
+        run: npm run copy:seeds
+
+      - name: Build renderer
+        working-directory: source
+        run: npm run build
+
+      - name: Build unsigned DMGs
+        working-directory: source
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: >
+          npx electron-builder
+          --mac dmg
+          --x64
+          --arm64
+          --publish never
+          -c.mac.identity=null
+          -c.mac.hardenedRuntime=false
+
+      - name: Verify macOS assets
+        working-directory: source
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          test -f "release/KhakiCollar-$version.dmg"
+          test -f "release/KhakiCollar-$version.dmg.blockmap"
+          test -f "release/KhakiCollar-$version-arm64.dmg"
+          test -f "release/KhakiCollar-$version-arm64.dmg.blockmap"
+          test -f "release/latest-mac.yml"
+
+      - name: Upload macOS assets to release
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.release_tag }}" \
+            release/*.dmg \
+            release/*.dmg.blockmap \
+            release/latest-mac.yml \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Show published macOS assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release view "${{ inputs.release_tag }}"
+          --repo "$GITHUB_REPOSITORY"
+          --json assets
+          --jq '.assets[].name'
